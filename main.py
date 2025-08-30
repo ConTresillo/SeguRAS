@@ -2,7 +2,8 @@ import tkinter as tk
 from tkinter import simpledialog, colorchooser
 from abc import ABC, abstractmethod
 import random, re
-
+import threading
+import time
 
 # ---------- Name allocation ----------
 class NameAllocator:
@@ -196,19 +197,32 @@ class Bag(ClickableObject):
         if item in self.items:
             messagebox.showinfo("Bag", f"{item.name} is already inside {self.name}")
             return
+
         self.items.append(item)
-        item.hide()  # hide item after adding
+        item.hide()
         messagebox.showinfo("Bag", f"{item.name} added to {self.name}")
+
+        # ---- RFID scan integration ----
+        if self.attached_scanner and item.attached_tag:
+            rfid = item.attached_tag.rfid
+            self.attached_scanner.add_rfid_from_bag(rfid, self)
 
     def remove_item(self, item):
         if item in self.items:
             self.items.remove(item)
+
+            # ---- RFID removal for bag ----
+            if self.attached_scanner and item.attached_tag:
+                self.attached_scanner.remove_rfids_from_bag(self)
+
             x1, y1, x2, y2 = self.canvas.bbox(self.shape_id)
             cx = x2 + 30
             cy = (y1 + y2) / 2
             item.show(cx, cy)
 
     def remove_all_items(self):
+        if self.attached_scanner:
+            self.attached_scanner.remove_rfids_from_bag(self)
         for item in self.items[:]:
             self.remove_item(item)
 
@@ -270,11 +284,21 @@ class Bag(ClickableObject):
 
     # ---------- menu ----------
     def extend_menu(self, menu):
-        if self.items:
+        # Open/close handled elsewhere
+
+        if self.items and self.is_open:
             menu.add_command(label="Remove Item", command=self.open_remove_item_window)
             menu.add_command(label="Remove All Items", command=self.remove_all_items)
+
         menu.add_command(label="Bag Info", command=self.show_info)
-        menu.add_command(label="View Contents", command=self.show_contents)  # ✅ new option
+        menu.add_command(label="View Contents", command=self.show_contents)
+
+        # ✅ New: show scanned RFIDs if scanner is attached
+        if self.attached_scanner:
+            menu.add_command(
+                label=f"See Scanned RFIDs ({self.attached_scanner.name})",
+                command=self.attached_scanner.show_scanned_rfids
+            )
 
     def open_remove_item_window(self):
         if not self.items:
@@ -595,6 +619,8 @@ class Scanner(ClickableObject):
         super().__init__(app, x, y, name, color)
         self.attached_bag = None
         self.hidden = False
+        self.scanned_rfids = set()  # only RFIDs added via bag
+        self.bag_added_rfids = {}   # {Bag.name: set(RFIDs added via this bag)}
 
     def create_shape(self, x, y):
         self.shape_id = self.canvas.create_rectangle(
@@ -622,13 +648,11 @@ class Scanner(ClickableObject):
         if not bag.is_open:
             messagebox.showwarning("Attach Scanner", f"Cannot attach {self.name}: {bag.name} is closed!")
             return
-
         if bag.attached_scanner is None:
             bag.attached_scanner = self
             self.attached_bag = bag
             bag.canvas.itemconfig(bag.shape_id, outline="blue")
-            self.hide()  # hide scanner when attached
-            print(f"✅ {self.name} attached to {bag.name}")
+            self.hide()
         else:
             messagebox.showinfo("Attach Scanner", f"{bag.name} already has a scanner")
 
@@ -638,7 +662,6 @@ class Scanner(ClickableObject):
             self.attached_bag = None
             bag.attached_scanner = None
             bag.canvas.itemconfig(bag.shape_id, outline="green" if bag.is_open else "red")
-            # show scanner again beside bag
             x1, y1, x2, y2 = self.canvas.bbox(bag.shape_id)
             cx = x2 + 40
             cy = (y1 + y2) / 2
@@ -646,29 +669,53 @@ class Scanner(ClickableObject):
 
     # ---------- menu ----------
     def extend_menu(self, menu):
-        """Adds scanner-specific commands to the base menu"""
+        # If attached, offer detach
         if self.attached_bag:
             menu.add_command(label="Detach from Bag", command=self.detach_from_bag)
 
-        nearest_bag = self._find_nearest_bag()
-        if nearest_bag and nearest_bag.attached_scanner is None:
-            def try_attach():
-                if not nearest_bag.is_open:
-                    messagebox.showwarning("Attach Scanner",
-                                           f"Cannot attach {self.name}: {nearest_bag.name} is closed!")
-                else:
-                    self.attach_to_bag(nearest_bag)
+        # If not attached, offer attach to nearest bag
+        elif not self.attached_bag:
+            nearest_bag = self._find_nearest_bag()
+            if nearest_bag:
+                menu.add_command(
+                    label=f"Attach to {nearest_bag.name}",
+                    command=lambda bag=nearest_bag: self.attach_to_bag(bag)
+                )
 
-            menu.add_command(label=f"Attach to Bag: {nearest_bag.name}", command=try_attach)
-
+        # Always offer scanner info
         menu.add_command(label="Scanner Info", command=self.show_info)
+        menu.add_command(label="See Scanned RFIDs", command=self.show_scanned_rfids)
 
     def show_menu(self, event):
         menu = self.build_base_menu(event)
         self.extend_menu(menu)
         menu.post(event.x_root, event.y_root)
 
-    # ---------- find nearest bag ----------
+    # ---------- scanning ----------
+    def add_rfid_from_bag(self, rfid, bag):
+        """Add RFID only via bag"""
+        if bag is None or rfid in self.scanned_rfids:
+            return
+        self.scanned_rfids.add(rfid)
+        self.bag_added_rfids.setdefault(bag.name, set()).add(rfid)
+
+    def remove_rfids_from_bag(self, bag):
+        """Remove only RFIDs that were added via this bag"""
+        rfids = self.bag_added_rfids.get(bag.name, set())
+        self.scanned_rfids -= rfids
+        self.bag_added_rfids[bag.name] = set()
+
+    # ---------- display ----------
+    def show_scanned_rfids(self):
+        win = tk.Toplevel(self.app.root)
+        win.title(f"Scanned RFIDs by {self.name}")
+        if self.scanned_rfids:
+            for rfid in self.scanned_rfids:
+                tk.Label(win, text=rfid, anchor="w").pack(fill="x", padx=5, pady=2)
+        else:
+            tk.Label(win, text="No RFIDs scanned yet.", font=("Arial", 10, "italic")).pack(padx=10, pady=5)
+
+    # ---------- helper ----------
     def _find_nearest_bag(self, max_dist=60):
         center = self._center_of_shape()
         if center is None:
@@ -693,8 +740,11 @@ class Scanner(ClickableObject):
         messagebox.showinfo(
             "Scanner Info",
             f"Scanner: {self.name}\n"
-            f"Attached Bag: {bag_info}"
+            f"Attached Bag: {bag_info}\n"
+            f"Total RFIDs via Bag: {len(self.scanned_rfids)}"
         )
+
+
 
 
 
@@ -726,7 +776,7 @@ class MenuManager:
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Scalable Objects GUI with Layer Manager")
+        self.root.title("SecuRAS")
 
         main_frame = tk.Frame(self.root)
         main_frame.pack(fill="both", expand=True)
