@@ -1,187 +1,241 @@
-from PyQt6.QtWidgets import QApplication, QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsItem, \
-    QMenuBar, QInputDialog, QColorDialog, QMenu
-from PyQt6.QtGui import QAction
-from PyQt6.QtGui import QBrush, QColor, QPainter
-from PyQt6.QtCore import Qt, QRectF, QPointF
-from PyQt6.QtGui import QCursor
-import sys
+import tkinter as tk
+from tkinter import simpledialog, colorchooser
+from abc import ABC, abstractmethod
+import random, re
 
-# ------------------- Base Class -------------------
-class ClickableObject(QGraphicsItem):
-    """Base class for all clickable objects with scalable naming and number tracking."""
+# ---------- Name allocation ----------
+class NameAllocator:
+    pools = {}
 
-    def __init__(self, w=50, h=50, color=QColor("gray"), name=None):
-        super().__init__()
-        self.rect = QRectF(0, 0, w, h)
-        self.color = color
+    @classmethod
+    def next_name(cls, type_name: str) -> str:
+        pool = cls.pools.setdefault(type_name, {"next": 1, "free": set()})
+        if pool["free"]:
+            n = min(pool["free"])
+            pool["free"].remove(n)
+        else:
+            n = pool["next"]
+            pool["next"] += 1
+        return f"{type_name}{n}"
 
-        cls = type(self)
-        # initialize used_numbers set for the subclass if missing
-        if not hasattr(cls, "used_numbers"):
-            cls.used_numbers = set()
+    @classmethod
+    def release_name(cls, type_name: str, name: str):
+        m = re.fullmatch(rf"{re.escape(type_name)}(\d+)", name)
+        if not m:
+            return
+        n = int(m.group(1))
+        pool = cls.pools.setdefault(type_name, {"next": 1, "free": set()})
+        if n < pool["next"] or n not in pool["free"]:
+            pool["free"].add(n)
 
-        # assign smallest available number
-        num = 1
-        while num in cls.used_numbers:
-            num += 1
-        cls.used_numbers.add(num)
-        self.number = num
 
-        # default name
-        self.name = name or f"{cls.__name__}{self.number}"
+# ---------- Abstract base ----------
+class ClickableObject(ABC):
+    instances = []
 
-        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+    def __init__(self, app, x, y, name=None, color=None):
+        if type(self) is ClickableObject:
+            raise TypeError("ClickableObject is abstract and cannot be instantiated directly")
 
-    def boundingRect(self):
-        return self.rect
+        self.app = app
+        self.canvas = app.canvas
+        self.layer_listbox = app.layer_listbox
 
-    def paint(self, painter, option, widget):
-        """Subclasses must override paint()"""
-        raise NotImplementedError("Subclasses must override paint()")
+        cls_name = self.__class__.__name__
+        self.name = name or NameAllocator.next_name(cls_name)
+        self.color = color or "#%06x" % random.randint(0, 0xFFFFFF)
 
-    # ---------------- Context menu ----------------
-    def contextMenuEvent(self, event):
-        # Correct
-        menu = QMenu()  # ✅ a QMenu, not a QMenuBar
-        rename_action = menu.addAction("Rename")
-        recolor_action = menu.addAction("Recolor")
-        duplicate_action = menu.addAction("Duplicate")
-        delete_action = menu.addAction("Delete")
+        self.shape_id = None
+        self.label_id = None
 
-        action = menu.exec(event.screenPos())
-        if action == rename_action:
-            self.rename()
-        elif action == recolor_action:
-            self.recolor()
-        elif action == duplicate_action:
-            self.duplicate()
-        elif action == delete_action:
-            self.delete()
+        self.create_shape(x, y)
+        self._create_or_update_label()
 
-    # ---------------- Helper Methods ----------------
-    def rename(self):
-        view = self.scene().views()[0]
-        text, ok = QInputDialog.getText(view, "Rename Object", "Enter new name:")
-        if ok:
-            self.name = text
-            self.update()
+        ClickableObject.instances.append(self)
+        self.layer_listbox.insert(tk.END, self.name)
+
+        for obj_id in (self.shape_id, self.label_id):
+            self.canvas.tag_bind(obj_id, "<Button-3>", self.show_menu)
+            self.canvas.tag_bind(obj_id, "<Button-1>", self.on_select)
+            self.canvas.tag_bind(obj_id, "<B1-Motion>", self.do_drag)
+
+        self._drag_data = {"x": 0, "y": 0}
+
+    @abstractmethod
+    def create_shape(self, x, y):
+        pass
+
+    # ------- helpers -------
+    def _center_of_shape(self):
+        x1, y1, x2, y2 = self.canvas.bbox(self.shape_id)
+        return (x1 + x2) / 2, (y1 + y2) / 2
+
+    def _create_or_update_label(self):
+        cx, cy = self._center_of_shape()
+        if self.label_id is None:
+            self.label_id = self.canvas.create_text(cx, cy, text=self.name)
+        else:
+            self.canvas.coords(self.label_id, cx, cy)
+            self.canvas.itemconfig(self.label_id, text=self.name)
+
+    def _current_index(self):
+        return ClickableObject.instances.index(self)
+
+    # ------- context menu -------
+    def show_menu(self, event):
+        menu = tk.Menu(self.canvas, tearoff=0)
+        actions = {
+            "Recolor": self.recolor,
+            "Rename": self.rename,
+            "Duplicate": lambda: self.duplicate(event.x + 20, event.y + 20),
+            "Delete": self.delete
+        }
+        for label, action in actions.items():
+            menu.add_command(label=label, command=action)
+        menu.post(event.x_root, event.y_root)
 
     def recolor(self):
-        view = self.scene().views()[0]
-        color = QColorDialog.getColor(initial=self.color, parent=view)
-        if color.isValid():
-            self.color = color
-            self.update()
+        color = colorchooser.askcolor(title="Choose new color", initialcolor=self.color)
+        if color and color[1]:
+            self.color = color[1]
+            self.canvas.itemconfig(self.shape_id, fill=self.color)
 
-    def duplicate(self):
-        cls = type(self)
-        copy = cls()
-        copy.setPos(self.pos() + QPointF(20, 20))
-        self.scene().addItem(copy)
+    def rename(self):
+        old_name = self.name
+        new_name = simpledialog.askstring("Rename", f"Enter new name for {self.name}:", initialvalue=self.name)
+        if not new_name or new_name == old_name:
+            return
+        NameAllocator.release_name(self.__class__.__name__, old_name)
+        self.name = new_name
+        self._create_or_update_label()
+        idx = self._current_index()
+        self.layer_listbox.delete(idx)
+        self.layer_listbox.insert(idx, self.name)
+
+    def duplicate(self, x, y):
+        new_obj = self.__class__(self.app, x, y, color=self.color)
+        new_obj._create_or_update_label()
 
     def delete(self):
-        cls = type(self)
-        # recycle the number
-        if hasattr(self, "number") and self.number in cls.used_numbers:
-            cls.used_numbers.remove(self.number)
-        self.scene().removeItem(self)
+        self.canvas.delete(self.shape_id)
+        self.canvas.delete(self.label_id)
+        NameAllocator.release_name(self.__class__.__name__, self.name)
+        if self in ClickableObject.instances:
+            idx = self._current_index()
+            ClickableObject.instances.remove(self)
+            self.layer_listbox.delete(idx)
 
-# ------------------- Subclasses -------------------
+    # --- Selection + Dragging ---
+    def on_select(self, event):
+        for obj in ClickableObject.instances:
+            self.canvas.itemconfig(obj.shape_id, width=1)
+        self.canvas.itemconfig(self.shape_id, width=3)
+        idx = self._current_index()
+        self.layer_listbox.selection_clear(0, tk.END)
+        self.layer_listbox.selection_set(idx)
+        self.layer_listbox.activate(idx)
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+
+    def do_drag(self, event):
+        dx = event.x - self._drag_data["x"]
+        dy = event.y - self._drag_data["y"]
+        self.canvas.move(self.shape_id, dx, dy)
+        self.canvas.move(self.label_id, dx, dy)
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+
+
+# ---------- Concrete shapes ----------
 class Bag(ClickableObject):
-    def __init__(self):
-        super().__init__(80, 80, QColor("blue"))
-
-    def paint(self, painter, option, widget):
-        painter.setBrush(QBrush(self.color))
-        painter.drawRect(self.rect)
-        painter.setPen(Qt.GlobalColor.black)
-        painter.drawText(self.rect, Qt.AlignmentFlag.AlignCenter, self.name)
+    def create_shape(self, x, y):
+        self.shape_id = self.canvas.create_rectangle(x, y, x + 80, y + 80, fill=self.color)
 
 class Item(ClickableObject):
+    def create_shape(self, x, y):
+        self.shape_id = self.canvas.create_rectangle(x, y, x + 40, y + 40, fill=self.color)
+
+class Tag(ClickableObject):
+    def create_shape(self, x, y):
+        r = 20
+        self.shape_id = self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=self.color)
+
+class Scanner(ClickableObject):
+    def create_shape(self, x, y):
+        self.shape_id = self.canvas.create_rectangle(x, y, x + 100, y + 40, fill=self.color)
+
+
+# ---------- Menu ----------
+class MenuManager:
+    def __init__(self, app):
+        self.app = app
+        self.object_classes = {
+            "Bag": Bag,
+            "Item": Item,
+            "Tag": Tag,
+            "Scanner": Scanner
+        }
+        self._build()
+
+    def _build(self):
+        menubar = tk.Menu(self.app.root)
+        add_menu = tk.Menu(menubar, tearoff=0)
+        for obj_name, cls in self.object_classes.items():
+            add_menu.add_command(
+                label=obj_name,
+                command=lambda c=cls: c(self.app, 50, 50)
+            )
+        menubar.add_cascade(label="Add", menu=add_menu)
+        self.app.root.config(menu=menubar)
+
+
+# ---------- App ----------
+class App:
     def __init__(self):
-        super().__init__(60, 60, QColor("red"))
+        self.root = tk.Tk()
+        self.root.title("Scalable Objects GUI with Layer Manager")
 
-    def paint(self, painter, option, widget):
-        painter.setBrush(QBrush(self.color))
-        painter.drawRect(self.rect)
-        painter.setPen(Qt.GlobalColor.black)
-        painter.drawText(self.rect, Qt.AlignmentFlag.AlignCenter, self.name)
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(fill="both", expand=True)
 
-class RFIDTag(ClickableObject):
-    def __init__(self):
-        super().__init__(40, 40, QColor("green"))
+        self.canvas = tk.Canvas(main_frame, width=700, height=500, bg="white")
+        self.canvas.pack(side="left", fill="both", expand=True)
 
-    def paint(self, painter, option, widget):
-        painter.setBrush(QBrush(self.color))
-        painter.drawEllipse(self.rect)
-        painter.setPen(Qt.GlobalColor.black)
-        painter.drawText(self.rect, Qt.AlignmentFlag.AlignCenter, self.name)
+        layer_frame = tk.Frame(main_frame, width=180)
+        layer_frame.pack(side="right", fill="y")
 
-class RFIDScanner(ClickableObject):
-    def __init__(self):
-        super().__init__(100, 50, QColor("orange"))
+        tk.Label(layer_frame, text="Layers", font=("Arial", 12, "bold")).pack()
+        self.layer_listbox = tk.Listbox(layer_frame)
+        self.layer_listbox.pack(fill="both", expand=True, padx=5, pady=5)
 
-    def paint(self, painter, option, widget):
-        painter.setBrush(QBrush(self.color))
-        painter.drawRect(self.rect)
-        painter.setPen(Qt.GlobalColor.black)
-        painter.drawText(self.rect, Qt.AlignmentFlag.AlignCenter, self.name)
+        MenuManager(self)
 
-# ------------------- Main Window -------------------
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("RFID System GUI")
+        self.layer_listbox.bind("<<ListboxSelect>>", self.on_layer_select)
+        self.canvas.bind("<Button-1>", self.unfocus, add="+")
 
-        self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
-        self.setCentralWidget(self.view)
+    def on_layer_select(self, event):
+        selection = self.layer_listbox.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if 0 <= idx < len(ClickableObject.instances):
+            obj = ClickableObject.instances[idx]
+            for o in ClickableObject.instances:
+                self.canvas.itemconfig(o.shape_id, width=1)
+            self.canvas.itemconfig(obj.shape_id, width=3)
+            obj._create_or_update_label()
 
-        self.current_type = None
-        self.ghost_item = None
+    def unfocus(self, event):
+        clicked = self.canvas.find_withtag("current")
+        if not clicked:
+            self.layer_listbox.selection_clear(0, tk.END)
+            for obj in ClickableObject.instances:
+                self.canvas.itemconfig(obj.shape_id, width=1)
 
-        # Menu
-        menu_bar = self.menuBar()
-        obj_menu = menu_bar.addMenu("Add Object")
-        for name, cls in [("Bag", Bag), ("Item", Item), ("RFID Tag", RFIDTag), ("RFID Scanner", RFIDScanner)]:
-            action = QAction(name, self)
-            action.triggered.connect(lambda checked, c=cls: self.select_type(c))
-            obj_menu.addAction(action)
+    def run(self):
+        self.root.mainloop()
 
-        # Mouse tracking
-        self.view.setMouseTracking(True)
-        self.view.viewport().installEventFilter(self)
 
-    # ---------------- Object selection ----------------
-    def select_type(self, cls):
-        self.current_type = cls
-        if self.ghost_item:
-            self.scene.removeItem(self.ghost_item)
-        pos = self.view.mapToScene(self.view.mapFromGlobal(QCursor.pos()))
-        self.ghost_item = cls()
-        self.ghost_item.setPos(pos - QPointF(self.ghost_item.rect.width()/2,
-                                             self.ghost_item.rect.height()/2))
-        self.ghost_item.setOpacity(0.5)
-        self.scene.addItem(self.ghost_item)
-
-    # ---------------- Event Filter ----------------
-    def eventFilter(self, source, event):
-        if self.ghost_item and event.type() == event.Type.MouseMove:
-            pos = self.view.mapToScene(event.position().toPoint())
-            self.ghost_item.setPos(pos - QPointF(self.ghost_item.rect.width()/2,
-                                                 self.ghost_item.rect.height()/2))
-        elif self.ghost_item and event.type() == event.Type.MouseButtonPress:
-            # Confirm placement
-            self.ghost_item.setOpacity(1.0)
-            self.ghost_item = None
-            self.current_type = None
-        return super().eventFilter(source, event)
-
-# ------------------- Run -------------------
+# ---------- Run ----------
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.resize(800, 600)
-    window.show()
-    sys.exit(app.exec())
+    App().run()
