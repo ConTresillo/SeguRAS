@@ -3,6 +3,7 @@ from tkinter import simpledialog, colorchooser
 from abc import ABC, abstractmethod
 import random, re
 
+
 # ---------- Name allocation ----------
 class NameAllocator:
     pools = {}
@@ -82,7 +83,7 @@ class ClickableObject(ABC):
         return ClickableObject.instances.index(self)
 
     # ------- context menu -------
-    def show_menu(self, event):
+    def build_base_menu(self, event):
         menu = tk.Menu(self.canvas, tearoff=0)
         actions = {
             "Recolor": self.recolor,
@@ -92,6 +93,13 @@ class ClickableObject(ABC):
         }
         for label, action in actions.items():
             menu.add_command(label=label, command=action)
+        return menu
+
+    def show_menu(self, event):
+        menu = self.build_base_menu(event)
+        # Call per-class menu extender if present
+        if hasattr(self, "extend_menu"):
+            self.extend_menu(menu)
         menu.post(event.x_root, event.y_root)
 
     def recolor(self):
@@ -148,17 +156,150 @@ class ClickableObject(ABC):
 
 # ---------- Concrete shapes ----------
 class Bag(ClickableObject):
+    def __init__(self, app, x, y, name=None, color=None):
+        self.is_open = False  # state
+        super().__init__(app, x, y, name, color)
+
     def create_shape(self, x, y):
-        self.shape_id = self.canvas.create_rectangle(x, y, x + 80, y + 80, fill=self.color)
+        self.shape_id = self.canvas.create_rectangle(
+            x, y, x + 80, y + 80,
+            fill=self.color,
+            outline="red",  # closed by default
+            width=3
+        )
+
+    def open_bag(self):
+        if not self.is_open:
+            self.is_open = True
+            self.canvas.itemconfig(self.shape_id, outline="green")
+
+    def close_bag(self):
+        if self.is_open:
+            self.is_open = False
+            self.canvas.itemconfig(self.shape_id, outline="red")
+
+    def show_menu(self, event):
+        menu = self.build_base_menu(event)
+        if self.is_open:
+            menu.insert_command(0, label="Close", command=self.close_bag)
+        else:
+            menu.insert_command(0, label="Open", command=self.open_bag)
+        menu.post(event.x_root, event.y_root)
+
 
 class Item(ClickableObject):
+    def __init__(self, app, x, y, name=None, color=None):
+        super().__init__(app, x, y, name, color)
+        self.attached_tag = None  # state: tag or None
+
     def create_shape(self, x, y):
-        self.shape_id = self.canvas.create_rectangle(x, y, x + 40, y + 40, fill=self.color)
+        self.shape_id = self.canvas.create_rectangle(
+            x, y, x + 40, y + 40,
+            fill=self.color, outline="black"
+        )
+
+    def extend_menu(self, menu):
+        if self.attached_tag:
+            menu.add_command(label="Remove Tag", command=self.remove_tag)
+
+    def remove_tag(self):
+        if self.attached_tag:
+            tag = self.attached_tag
+            self.attached_tag = None
+            tag.attached_item = None
+            self.canvas.itemconfig(self.shape_id, outline="black")
+            # show tag again beside the item
+            x1, y1, x2, y2 = self.canvas.bbox(self.shape_id)
+            cx = x2 + 30
+            cy = (y1 + y2) / 2
+            tag.show(cx, cy)
+
+    def do_drag(self, event):
+        dx = event.x - self._drag_data["x"]
+        dy = event.y - self._drag_data["y"]
+        self.canvas.move(self.shape_id, dx, dy)
+        self.canvas.move(self.label_id, dx, dy)
+
+        # move tag if attached
+        if self.attached_tag:
+            self.canvas.move(self.attached_tag.shape_id, dx, dy)
+            self.canvas.move(self.attached_tag.label_id, dx, dy)
+
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+
 
 class Tag(ClickableObject):
+    def __init__(self, app, x, y, name=None, color=None):
+        super().__init__(app, x, y, name, color)
+        self.attached_item = None
+        self.hidden = False
+
     def create_shape(self, x, y):
         r = 20
-        self.shape_id = self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=self.color)
+        self.shape_id = self.canvas.create_oval(
+            x - r, y - r, x + r, y + r,
+            fill=self.color, outline="black"
+        )
+
+    def hide(self):
+        if not self.hidden:
+            self.hidden = True
+            self.canvas.itemconfigure(self.shape_id, state="hidden")
+            self.canvas.itemconfigure(self.label_id, state="hidden")
+
+    def show(self, cx=None, cy=None):
+        if self.hidden:
+            self.hidden = False
+            if cx and cy:
+                r = 20
+                self.canvas.coords(self.shape_id, cx - r, cy - r, cx + r, cy + r)
+                self.canvas.coords(self.label_id, cx, cy)
+            self.canvas.itemconfigure(self.shape_id, state="normal")
+            self.canvas.itemconfigure(self.label_id, state="normal")
+
+    def attach_to_item(self, item):
+        if self.attached_item is None and item.attached_tag is None:
+            self.attached_item = item
+            item.attached_tag = self
+            self.canvas.itemconfig(item.shape_id, outline="blue")
+            self.hide()   # just hide instead of moving
+
+    def detach_from_item(self):
+        if self.attached_item:
+            item = self.attached_item
+            self.attached_item = None
+            item.attached_tag = None
+            self.canvas.itemconfig(item.shape_id, outline="black")
+            # reappear next to item
+            x1, y1, x2, y2 = self.canvas.bbox(item.shape_id)
+            cx = x2 + 30
+            cy = (y1 + y2) / 2
+            self.show(cx, cy)
+
+    def extend_menu(self, menu):
+        if self.attached_item is None:
+            nearest_item = self.find_nearest_item()
+            if nearest_item:
+                menu.add_command(label="Attach to Item",
+                                 command=lambda: self.attach_to_item(nearest_item))
+        else:
+            menu.add_command(label="Detach", command=self.detach_from_item)
+
+    def find_nearest_item(self, max_distance=60):
+        tx, ty = self._center_of_shape()
+        nearest = None
+        nearest_dist = max_distance
+        for obj in ClickableObject.instances:
+            if isinstance(obj, Item) and obj.attached_tag is None:
+                cx, cy = obj._center_of_shape()
+                dist = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+                if dist < nearest_dist:
+                    nearest = obj
+                    nearest_dist = dist
+        return nearest
+
+
 
 class Scanner(ClickableObject):
     def create_shape(self, x, y):
