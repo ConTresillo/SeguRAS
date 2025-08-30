@@ -187,6 +187,9 @@ class Bag(ClickableObject):
 
     # ---------- items ----------
     def add_item(self, item):
+        if not self.is_open:
+            messagebox.showwarning("Bag", f"Cannot add {item.name}: Bag is closed!")
+            return
         if len(self.items) >= self.max_items:
             messagebox.showwarning("Bag", f"Bag limit reached! (max {self.max_items})")
             return
@@ -200,7 +203,6 @@ class Bag(ClickableObject):
     def remove_item(self, item):
         if item in self.items:
             self.items.remove(item)
-            # show item again beside bag
             x1, y1, x2, y2 = self.canvas.bbox(self.shape_id)
             cx = x2 + 30
             cy = (y1 + y2) / 2
@@ -212,8 +214,14 @@ class Bag(ClickableObject):
 
     # ---------- scanner attach/remove ----------
     def add_scanner(self, scanner):
+        if not self.is_open:
+            print(f"⚠️ Cannot attach scanner: {self.name} is closed")
+            return False
         if self.attached_scanner is None:
             self.attached_scanner = scanner
+            scanner.attached_bag = self
+            scanner.hide()
+            self.canvas.itemconfig(self.shape_id, outline="blue")
             print(f"✅ Scanner added to {self.name}")
             return True
         else:
@@ -223,23 +231,50 @@ class Bag(ClickableObject):
     def remove_scanner(self):
         if self.attached_scanner:
             self.attached_scanner.attached_bag = None
-            # show scanner again beside the bag
             x1, y1, x2, y2 = self.canvas.bbox(self.shape_id)
             cx = x2 + 40
             cy = (y1 + y2) / 2
             self.attached_scanner.show(cx, cy)
-
             self.attached_scanner = None
             self.canvas.itemconfig(self.shape_id, outline="green" if self.is_open else "red")
+
+    # ---------- recursive delete ----------
+    def delete_self(self):
+        # Delete all items and their tags
+        for item in self.items[:]:
+            if item.attached_tag:
+                item.attached_tag.detach_from_item()
+                if item.attached_tag in ClickableObject.instances:
+                    ClickableObject.instances.remove(item.attached_tag)
+                if hasattr(item.attached_tag, "label_id"):
+                    self.canvas.delete(item.attached_tag.label_id)
+            if item in ClickableObject.instances:
+                ClickableObject.instances.remove(item)
+            if hasattr(item, "shape_id"):
+                self.canvas.delete(item.shape_id)
+            if hasattr(item, "label_id"):
+                self.canvas.delete(item.label_id)
+            self.items.remove(item)
+
+        # Remove scanner if attached
+        if self.attached_scanner:
+            self.remove_scanner()
+
+        # Remove the bag itself
+        if self in ClickableObject.instances:
+            ClickableObject.instances.remove(self)
+        if hasattr(self, "shape_id"):
+            self.canvas.delete(self.shape_id)
+        if hasattr(self, "label_id"):
+            self.canvas.delete(self.label_id)
 
     # ---------- menu ----------
     def extend_menu(self, menu):
         if self.items:
             menu.add_command(label="Remove Item", command=self.open_remove_item_window)
             menu.add_command(label="Remove All Items", command=self.remove_all_items)
-
-        # Bag info is always available
         menu.add_command(label="Bag Info", command=self.show_info)
+        menu.add_command(label="View Contents", command=self.show_contents)  # ✅ new option
 
     def open_remove_item_window(self):
         if not self.items:
@@ -264,6 +299,28 @@ class Bag(ClickableObject):
                 win.destroy()
 
         tk.Button(win, text="Remove", command=remove_selected).pack(pady=5)
+
+    # ---------- show contents ----------
+    def show_contents(self):
+        win = tk.Toplevel(self.app.root)
+        win.title(f"Contents of {self.name}")
+
+        # Scanner info
+        scanner_name = self.attached_scanner.name if self.attached_scanner else "None"
+        tk.Label(win, text=f"Scanner: {scanner_name}", font=("Arial", 12, "bold")).pack(padx=10, pady=5)
+
+        # List of items with their info
+        if self.items:
+            for item in self.items:
+                frame = tk.Frame(win, relief=tk.RAISED, borderwidth=1)
+                frame.pack(fill="x", padx=10, pady=3)
+
+                tag_name = item.attached_tag.name if item.attached_tag else "None"
+                rfid_info = f"RFID: {item.attached_tag.rfid}" if item.attached_tag else ""
+                info_text = f"Item: {item.name} | Tag: {tag_name} {rfid_info}"
+                tk.Label(frame, text=info_text, anchor="w").pack(padx=5, pady=2)
+        else:
+            tk.Label(win, text="No items inside.", font=("Arial", 10, "italic")).pack(padx=10, pady=5)
 
     def show_menu(self, event):
         menu = self.build_base_menu(event)
@@ -332,7 +389,7 @@ class Item(ClickableObject):
             return
         self.attached_tag = tag
         tag.attached_item = self
-        self.rfid = tag.rfid
+        self.rfid = tag.rfid  # ✅ update RFID when tag is attached
         self.canvas.itemconfig(self.shape_id, outline="blue")
 
     def remove_tag(self):
@@ -340,7 +397,7 @@ class Item(ClickableObject):
             tag = self.attached_tag
             self.attached_tag = None
             tag.attached_item = None
-            self.rfid = "No RFID"
+            self.rfid = "No RFID"  # ✅ update RFID when tag is removed
             self.canvas.itemconfig(self.shape_id, outline="black")
             # show tag again beside the item
             bbox = self.canvas.bbox(self.shape_id)
@@ -349,26 +406,50 @@ class Item(ClickableObject):
                 cx = x2 + 30
                 cy = (y1 + y2) / 2
                 tag.show(cx, cy)
-
     # ---------- menu ----------
     def extend_menu(self, menu):
         if self.attached_tag:
             menu.add_command(label="Remove Tag", command=self.remove_tag)
 
-        nearest_bag = self.find_nearest_bag()
+        # Find the nearest bag regardless of open/closed
+        nearest_bag = None
+        center = self._center_of_shape()
+        if center:
+            ix, iy = center
+            nearest_dist = 80
+            for obj in ClickableObject.instances:
+                if isinstance(obj, Bag):
+                    bbox = obj._center_of_shape()
+                    if bbox is None:
+                        continue
+                    bx, by = bbox
+                    dist = ((ix - bx) ** 2 + (iy - by) ** 2) ** 0.5
+                    if dist < nearest_dist:
+                        nearest_bag = obj
+                        nearest_dist = dist
+
         if nearest_bag:
-            menu.add_command(label=f"Add to Bag: {nearest_bag.name}",
-                             command=lambda b=nearest_bag: b.add_item(self))
+            def try_add():
+                if not nearest_bag.is_open:
+                    messagebox.showwarning(
+                        "Add to Bag",
+                        f"Cannot add {self.name}: {nearest_bag.name} is closed!"
+                    )
+                else:
+                    nearest_bag.add_item(self)
+
+            menu.add_command(label=f"Add to Bag: {nearest_bag.name}", command=try_add)
 
         menu.add_command(label="Item Info", command=self.show_info)
 
     def show_info(self):
         tag_info = self.attached_tag.name if self.attached_tag else "None"
+        rfid_info = self.attached_tag.rfid if self.attached_tag else "No RFID"  # ✅ use actual tag RFID
         messagebox.showinfo(
             "Item Info",
             f"Item: {self.name}\n"
-            f"Tag: {tag_info}\n"
-            f"RFID: {self.rfid}"
+            f"{f'Tag: {self.attached_tag.name}\n' if self.attached_tag else ''}"
+            f"{f'RFID: {self.attached_tag.rfid}\n' if self.attached_tag else ''}"
         )
 
     # ---------- find nearest bag ----------
@@ -412,8 +493,6 @@ class Item(ClickableObject):
             return None
         x1, y1, x2, y2 = bbox
         return ((x1 + x2) / 2, (y1 + y2) / 2)
-
-
 
 
 class Tag(ClickableObject):
@@ -511,8 +590,6 @@ class Tag(ClickableObject):
         return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
-
-
 class Scanner(ClickableObject):
     def __init__(self, app, x, y, name=None, color=None):
         super().__init__(app, x, y, name, color)
@@ -542,11 +619,18 @@ class Scanner(ClickableObject):
 
     # ---------- attach/detach ----------
     def attach_to_bag(self, bag):
+        if not bag.is_open:
+            messagebox.showwarning("Attach Scanner", f"Cannot attach {self.name}: {bag.name} is closed!")
+            return
+
         if bag.attached_scanner is None:
             bag.attached_scanner = self
             self.attached_bag = bag
             bag.canvas.itemconfig(bag.shape_id, outline="blue")
             self.hide()  # hide scanner when attached
+            print(f"✅ {self.name} attached to {bag.name}")
+        else:
+            messagebox.showinfo("Attach Scanner", f"{bag.name} already has a scanner")
 
     def detach_from_bag(self):
         if self.attached_bag:
@@ -561,26 +645,56 @@ class Scanner(ClickableObject):
             self.show(cx, cy)
 
     # ---------- menu ----------
-    def show_menu(self, event):
-        menu = self.build_base_menu(event)
-        nearest_bag = self._find_nearest_bag()
-        if nearest_bag and nearest_bag.attached_scanner is None:
-            menu.insert_command(0, label="Attach to Bag",
-                                command=lambda b=nearest_bag: self.attach_to_bag(b))
+    def extend_menu(self, menu):
+        """Adds scanner-specific commands to the base menu"""
         if self.attached_bag:
             menu.add_command(label="Detach from Bag", command=self.detach_from_bag)
+
+        nearest_bag = self._find_nearest_bag()
+        if nearest_bag and nearest_bag.attached_scanner is None:
+            def try_attach():
+                if not nearest_bag.is_open:
+                    messagebox.showwarning("Attach Scanner",
+                                           f"Cannot attach {self.name}: {nearest_bag.name} is closed!")
+                else:
+                    self.attach_to_bag(nearest_bag)
+
+            menu.add_command(label=f"Attach to Bag: {nearest_bag.name}", command=try_attach)
+
+        menu.add_command(label="Scanner Info", command=self.show_info)
+
+    def show_menu(self, event):
+        menu = self.build_base_menu(event)
+        self.extend_menu(menu)
         menu.post(event.x_root, event.y_root)
 
     # ---------- find nearest bag ----------
     def _find_nearest_bag(self, max_dist=60):
-        sx, sy = self._center_of_shape()
+        center = self._center_of_shape()
+        if center is None:
+            return None
+        sx, sy = center
+        nearest = None
+        nearest_dist = max_dist
         for obj in ClickableObject.instances:
             if isinstance(obj, Bag):
-                bx, by = obj._center_of_shape()
+                bbox = obj._center_of_shape()
+                if bbox is None:
+                    continue
+                bx, by = bbox
                 dist = ((sx - bx) ** 2 + (sy - by) ** 2) ** 0.5
-                if dist < max_dist:
-                    return obj
-        return None
+                if dist < nearest_dist:
+                    nearest = obj
+                    nearest_dist = dist
+        return nearest
+
+    def show_info(self):
+        bag_info = self.attached_bag.name if self.attached_bag else "None"
+        messagebox.showinfo(
+            "Scanner Info",
+            f"Scanner: {self.name}\n"
+            f"Attached Bag: {bag_info}"
+        )
 
 
 
