@@ -155,9 +155,13 @@ class ClickableObject(ABC):
 
 
 # ---------- Concrete shapes ----------
+from tkinter import messagebox
+
+
 class Bag(ClickableObject):
     def __init__(self, app, x, y, name=None, color=None):
-        self.is_open = False  # state
+        self.is_open = False
+        self.attached_scanner = None  # keep consistent
         super().__init__(app, x, y, name, color)
 
     def create_shape(self, x, y):
@@ -168,6 +172,7 @@ class Bag(ClickableObject):
             width=3
         )
 
+    # ---------- open/close ----------
     def open_bag(self):
         if not self.is_open:
             self.is_open = True
@@ -178,12 +183,37 @@ class Bag(ClickableObject):
             self.is_open = False
             self.canvas.itemconfig(self.shape_id, outline="red")
 
+    # ---------- scanner attach/remove ----------
+    def add_scanner(self, scanner):
+        if self.attached_scanner is None:
+            self.attached_scanner = scanner
+            scanner.attached_bag = self
+            self.canvas.itemconfig(self.shape_id, outline="blue")
+        else:
+            messagebox.showinfo("Bag", f"{self.name} already has a scanner attached!")
+
+    def remove_scanner(self):
+        if self.attached_scanner:
+            self.attached_scanner.attached_bag = None
+            # show scanner again beside the bag
+            x1, y1, x2, y2 = self.canvas.bbox(self.shape_id)
+            cx = x2 + 40
+            cy = (y1 + y2) / 2
+            self.attached_scanner.show(cx, cy)
+
+            self.attached_scanner = None
+            self.canvas.itemconfig(self.shape_id, outline="green" if self.is_open else "red")
+
     def show_menu(self, event):
         menu = self.build_base_menu(event)
         if self.is_open:
             menu.insert_command(0, label="Close", command=self.close_bag)
         else:
             menu.insert_command(0, label="Open", command=self.open_bag)
+
+        if self.attached_scanner:
+            menu.add_command(label="Remove Scanner", command=self.remove_scanner)
+
         menu.post(event.x_root, event.y_root)
 
 
@@ -263,7 +293,7 @@ class Tag(ClickableObject):
             self.attached_item = item
             item.attached_tag = self
             self.canvas.itemconfig(item.shape_id, outline="blue")
-            self.hide()   # just hide instead of moving
+            self.hide()  # just hide instead of moving
 
     def detach_from_item(self):
         if self.attached_item:
@@ -300,10 +330,56 @@ class Tag(ClickableObject):
         return nearest
 
 
-
 class Scanner(ClickableObject):
+    def __init__(self, app, x, y, name=None, color=None):
+        super().__init__(app, x, y, name, color)
+        self.attached_bag = None
+        self.hidden = False
+
     def create_shape(self, x, y):
-        self.shape_id = self.canvas.create_rectangle(x, y, x + 100, y + 40, fill=self.color)
+        self.shape_id = self.canvas.create_rectangle(
+            x, y, x + 100, y + 40, fill=self.color
+        )
+
+    def hide(self):
+        if not self.hidden:
+            self.hidden = True
+            self.canvas.itemconfig(self.shape_id, state="hidden")
+            self.canvas.itemconfig(self.label_id, state="hidden")
+
+    def show(self, cx=None, cy=None):
+        if self.hidden:
+            self.hidden = False
+            if cx and cy:
+                self.canvas.coords(self.shape_id, cx, cy, cx + 100, cy + 40)
+                self.canvas.coords(self.label_id, cx + 50, cy + 20)
+            self.canvas.itemconfig(self.shape_id, state="normal")
+            self.canvas.itemconfig(self.label_id, state="normal")
+
+    def attach_to_bag(self, bag):
+        if bag.attached_scanner is None:
+            bag.attached_scanner = self
+            self.attached_bag = bag
+            bag.canvas.itemconfig(bag.shape_id, outline="blue")
+            self.hide()
+
+    def show_menu(self, event):
+        menu = self.build_base_menu(event)
+        nearest_bag = self._find_nearest_bag()
+        if nearest_bag and nearest_bag.attached_scanner is None:
+            menu.insert_command(0, label="Attach to Bag",
+                                command=lambda b=nearest_bag: self.attach_to_bag(b))
+        menu.post(event.x_root, event.y_root)
+
+    def _find_nearest_bag(self, max_dist=60):
+        sx, sy = self._center_of_shape()
+        for obj in ClickableObject.instances:
+            if isinstance(obj, Bag):
+                bx, by = obj._center_of_shape()
+                dist = ((sx - bx) ** 2 + (sy - by) ** 2) ** 0.5
+                if dist < max_dist:
+                    return obj
+        return None
 
 
 # ---------- Menu ----------
